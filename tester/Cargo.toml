@@ -1,0 +1,12 @@
+[package]
+name = "tester"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = { version ="0.3" }
+tokio = { version = "1.32", features = ["full"] }
+bytes = "1.10"
+
+netropy = { path = "../netropy"} 
