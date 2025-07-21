@@ -1,14 +1,14 @@
 use crate::{
-    iface::SimInterface,
+    iface::{SimCommand, SimInterface},
     link::{LinkConfig, Packet},
     time::{ScheduledEvent, SimTime},
 };
 use std::{
     collections::{BinaryHeap, HashMap, HashSet},
     future::Future,
-    sync::Arc, time::Duration,
+    sync::Arc,
 };
-use tokio::{sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender}, time::sleep};
+use tokio::{sync::{mpsc::{self, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender}, RwLock}, time::timeout};
 use tokio::sync::Mutex;
 use tokio::time::Duration as TokioDuration;
 
@@ -19,7 +19,7 @@ pub struct NodeId(pub String);
 /// builder for the simulation
 pub struct SimNetBuilder {
     nodes: HashSet<NodeId>,
-    links: Vec<(NodeId, NodeId, LinkConfig)>,
+    links: Arc<RwLock<Vec<(NodeId, NodeId, LinkConfig)>>>,
     speed: f64,
 }
 
@@ -27,7 +27,7 @@ impl SimNetBuilder {
     pub fn new() -> Self {
         Self {
             nodes: HashSet::new(),
-            links: Vec::new(),
+            links: Arc::new(RwLock::new(Vec::new())),
             speed: 1.0,
         }
     }
@@ -37,13 +37,32 @@ impl SimNetBuilder {
         self
     }
 
+    // TODO: candidate for async
     pub fn add_link(
         &mut self,
         a: impl Into<String>,
         b: impl Into<String>,
         cfg: LinkConfig,
     ) -> &mut Self {
-        self.links.push((NodeId(a.into()), NodeId(b.into()), cfg));
+        let links = self.links.clone();
+        let mut w = links.blocking_write();
+        w.push((NodeId(a.into()), NodeId(b.into()), cfg));
+        self
+    }
+
+    pub async fn add_bi_link(
+        &mut self,
+        a: impl Into<String>,
+        b: impl Into<String>,
+        cfg: LinkConfig,
+        cfg_back: Option<LinkConfig>,
+    ) -> &mut Self {
+        let links = self.links.clone();
+        let a = NodeId(a.into());
+        let b = NodeId(b.into());
+        let mut w = links.write().await;
+        w.push((a.clone(), b.clone(), cfg.clone()));
+        w.push((b, a, cfg_back.unwrap_or(cfg)));
         self
     }
 
@@ -66,8 +85,9 @@ impl SimNetBuilder {
 pub struct SimNet {
     inbox_senders: HashMap<NodeId, UnboundedSender<Packet>>,
     inbox_receivers: HashMap<NodeId, UnboundedReceiver<Packet>>,
-    links: Vec<(NodeId, NodeId, LinkConfig)>,
+    links: Arc<RwLock<Vec<(NodeId, NodeId, LinkConfig)>>>,
     queue: Arc<Mutex<BinaryHeap<ScheduledEvent<Packet>>>>,
+    command_channel: (Sender<SimCommand>, Receiver<SimCommand>),
     now: SimTime,
     speed: f64,
 }
@@ -75,11 +95,13 @@ pub struct SimNet {
 impl SimNet {
     fn new(
         nodes: HashSet<NodeId>,
-        links: Vec<(NodeId, NodeId, LinkConfig)>,
+        links: Arc<RwLock<Vec<(NodeId, NodeId, LinkConfig)>>>,
         speed: f64,
     ) -> Self {
         let mut inbox_senders = HashMap::new();
         let mut inbox_receivers = HashMap::new();
+
+        let command_channel = mpsc::channel(32);
 
         for node in nodes.into_iter() {
             let (tx, rx) = unbounded_channel();
@@ -94,6 +116,7 @@ impl SimNet {
             queue: Arc::new(Mutex::new(BinaryHeap::new())),
             now: SimTime(0),
             speed,
+            command_channel,
         }
     }
 
@@ -125,14 +148,17 @@ impl SimNet {
         });
     }
 
-    /// endless run the scheduler
+    /// returns a sender for enqueuing sim commands
+    pub fn command_tx(&self) -> Sender<SimCommand> {
+        self.command_channel.0.clone()
+    }
+
+    /// endless run the scheduler, until receive of shutdown command
     pub async fn run(mut self) {
         // let tasks enqueue their first sends
         tokio::task::yield_now().await;
 
         loop {
-            sleep(Duration::from_millis(1)).await;
-
             while let Some(ScheduledEvent { when, payload }) = {
                 let mut q = self.queue.lock().await;
                 q.pop()
@@ -152,14 +178,40 @@ impl SimNet {
 
                 // deliver packet
                 if let Some(tx) = self.inbox_senders.get(&payload.dst) {
+                    Self::packet_log(&format!("rx {payload:?}"));
                     let _ = tx.send(payload);
                 }
 
                 // let the node tasks run
                 tokio::task::yield_now().await;
             }
+
+            // handle sim commands
+            // TODO: whole loop is suboptimal, we should use a notify mechanic if smth is added to the queue
+            // combined with tokio select for polling on queue and command channel
+            match timeout(TokioDuration::from_millis(1), self.command_channel.1.recv()).await {
+                Ok(Some(cmd)) => {
+                    match cmd {
+                        SimCommand::Shutdown => {
+                            tracing::info!("received shutdown command");
+                            break;
+                        },
+                    }
+                },
+                Ok(None) => {},
+                Err(_) => {},
+            }
         }
 
         // Dropping the senders will cause node tasks to observe SimulationEnded
+    }
+
+    #[cfg(feature = "packet_tracing")]
+    fn packet_log(msg: &str) {
+        tracing::debug!("{msg}");
+    }
+
+    #[cfg(not(feature = "packet_tracing"))]
+    fn packet_log(msg: &str) {
     }
 }

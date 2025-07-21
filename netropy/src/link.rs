@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
 use crate::NodeId;
 
@@ -10,10 +10,17 @@ pub struct LinkConfig {
 }
 
 /// network packet scheduled for delivery
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Packet {
     pub src: NodeId,
     pub dst: NodeId,
     pub data: Bytes,
     pub at: super::time::SimTime,
+    pub id: String,
+}
+
+impl fmt::Debug for Packet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}->{} [#{}]", self.src.0, self.dst.0, self.id)
+    }
 }

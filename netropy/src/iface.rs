@@ -7,16 +7,22 @@ use crate::{
 use bytes::Bytes;
 use std::{
     collections::BinaryHeap,
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicU64, Ordering}},
     time::Duration,
 };
-use tokio::sync::{mpsc::UnboundedReceiver, Mutex};
+use tokio::sync::{mpsc::UnboundedReceiver, Mutex, RwLock};
 use crate::link::LinkConfig;
+
+static CURRENT_PACKET_ID: AtomicU64 = AtomicU64::new(0);
+
+pub enum SimCommand {
+    Shutdown,
+}
 
 pub struct SimInterface {
     me: NodeId,
     rx: UnboundedReceiver<Packet>,
-    links: Vec<(NodeId, NodeId, LinkConfig)>,
+    links: Arc<RwLock<Vec<(NodeId, NodeId, LinkConfig)>>>,
     queue: Arc<Mutex<BinaryHeap<ScheduledEvent<Packet>>>>,
     now: SimTime,
 }
@@ -25,11 +31,11 @@ impl SimInterface {
     pub(crate) fn new(
         me: NodeId,
         rx: UnboundedReceiver<Packet>,
-        links: Vec<(NodeId, NodeId, LinkConfig)>,
+        links: Arc<RwLock<Vec<(NodeId, NodeId, LinkConfig)>>>,
         queue: Arc<Mutex<BinaryHeap<ScheduledEvent<Packet>>>>,
         now: SimTime,
     ) -> Self {
-        SimInterface { me, rx, links, queue, now }
+        Self { me, rx, links, queue, now }
     }
 
     pub async fn send(
@@ -37,8 +43,8 @@ impl SimInterface {
         dst: &NodeId,
         data: Bytes,
     ) -> Result<(), SimError> {
-        let cfg = self
-            .links
+        let link_read = self.links.read().await;
+        let cfg = link_read
             .iter()
             .find(|(a, b, _)| &self.me == a && dst == b)
             .map(|(_, _, cfg)| cfg.clone())
@@ -51,14 +57,18 @@ impl SimInterface {
             .and_then(|t| t.checked_add(Duration::from_nanos(jitter_ns)))
             .unwrap();
 
+        CURRENT_PACKET_ID.fetch_add(1, Ordering::SeqCst);
+
         let pkt = Packet {
             src: self.me.clone(),
             dst: dst.clone(),
             data,
             at,
+            id: CURRENT_PACKET_ID.load(Ordering::SeqCst).to_string()
         };
 
         let mut q = self.queue.lock().await;
+        Self::packet_log(&format!("tx {pkt:?}"));
         q.push(ScheduledEvent { when: at, payload: pkt });
         Ok(())
     }
@@ -72,5 +82,14 @@ impl SimInterface {
 
     pub async fn sleep(&self, dur: Duration) {
         tokio::time::sleep(dur).await;
+    }
+
+    #[cfg(feature = "packet_tracing")]
+    fn packet_log(msg: &str) {
+        tracing::debug!("{msg}");
+    }
+
+    #[cfg(not(feature = "packet_tracing"))]
+    fn packet_log(msg: &str) {
     }
 }

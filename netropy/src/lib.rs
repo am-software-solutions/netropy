@@ -9,3 +9,4 @@ pub use error::SimError;
 pub use link::{LinkConfig, Packet};
 pub use network::{SimNetBuilder, SimNet, NodeId};
 pub use iface::SimInterface;
+pub use iface::SimCommand;
